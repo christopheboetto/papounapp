@@ -7,6 +7,7 @@ qu'elle n'aime pas). Ce format correspond exactement à la future Google Sheet,
 seules les fonctions charger_donnees / sauvegarder_donnees changeront.
 """
 
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -15,8 +16,10 @@ from pyvis.network import Network
 from streamlit_gsheets import GSheetsConnection
 
 DATA_FILE = Path(__file__).parent / "data.csv"
+RECETTES_FILE = Path(__file__).parent / "recettes.csv"
 COL_NOM = "Nom"
 COL_ALIMENT = "Aliment"
+COLONNES_RECETTES = ["Recette", "Type", "Ingrédients", "Lien"]
 
 COULEUR_PERSONNE = "#4e79a7"
 COULEUR_ALIMENT = "#f28e2b"
@@ -27,6 +30,7 @@ COULEUR_ALIMENT = "#f28e2b"
 # ---------------------------------------------------------------------------
 
 FEUILLE = "aversions"  # nom de l'onglet dans la Google Sheet
+FEUILLE_RECETTES = "recettes"
 
 
 def utilise_gsheet() -> bool:
@@ -55,6 +59,25 @@ def charger_donnees() -> pd.DataFrame:
     return pd.DataFrame(columns=[COL_NOM, COL_ALIMENT])
 
 
+def charger_recettes() -> pd.DataFrame:
+    df = None
+    if utilise_gsheet():
+        try:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            df = conn.read(worksheet=FEUILLE_RECETTES, ttl=0)
+        except Exception:
+            df = None  # l'onglet "recettes" n'existe pas (encore) dans la Sheet
+    elif RECETTES_FILE.exists():
+        df = pd.read_csv(RECETTES_FILE, dtype=str)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=COLONNES_RECETTES)
+    for col in COLONNES_RECETTES:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[COLONNES_RECETTES].fillna("").astype(str)
+    return df[df["Recette"].str.strip() != ""]
+
+
 def sauvegarder_donnees(df: pd.DataFrame) -> None:
     df = df.sort_values([COL_NOM, COL_ALIMENT]).reset_index(drop=True)
     if utilise_gsheet():
@@ -62,6 +85,18 @@ def sauvegarder_donnees(df: pd.DataFrame) -> None:
         conn.update(worksheet=FEUILLE, data=df)
     else:
         df.to_csv(DATA_FILE, index=False)
+
+
+def sauvegarder_recettes(df: pd.DataFrame) -> None:
+    df = df[COLONNES_RECETTES].sort_values(["Type", "Recette"]).reset_index(drop=True)
+    if utilise_gsheet():
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        try:
+            conn.update(worksheet=FEUILLE_RECETTES, data=df)
+        except Exception:
+            conn.create(worksheet=FEUILLE_RECETTES, data=df)
+    else:
+        df.to_csv(RECETTES_FILE, index=False)
 
 
 def normaliser(texte: str) -> str:
@@ -72,6 +107,26 @@ def normaliser(texte: str) -> str:
 def normaliser_nom(texte: str) -> str:
     """'jean dupont' -> 'Jean Dupont'."""
     return " ".join(mot.capitalize() for mot in texte.split())
+
+
+def cle_aliment(texte: str) -> str:
+    """Clé de comparaison tolérante : 'Œufs' et 'oeuf' donnent la même clé.
+
+    On compare des ingrédients entiers (jamais des sous-chaînes), donc
+    'Pommes' ne bloque pas 'Pommes de terre'.
+    """
+    t = texte.strip().lower().replace("œ", "oe")
+    t = "".join(c for c in unicodedata.normalize("NFD", t) if unicodedata.category(c) != "Mn")
+    return t[:-1] if t.endswith("s") else t
+
+
+def recettes_compatibles(recettes: pd.DataFrame, aliments_interdits: set) -> pd.DataFrame:
+    interdits = {cle_aliment(a) for a in aliments_interdits}
+
+    def ok(ingredients: str) -> bool:
+        return not any(cle_aliment(i) in interdits for i in ingredients.split(",") if i.strip())
+
+    return recettes[recettes["Ingrédients"].apply(ok)]
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +181,18 @@ st.set_page_config(page_title="Papounapp", page_icon="🍽️", layout="wide")
 st.title("🍽️ Papounapp — les goûts de chacun")
 
 df = charger_donnees()
+recettes_df = charger_recettes()
 noms_existants = sorted(df[COL_NOM].unique())
 aliments_existants = sorted(df[COL_ALIMENT].unique())
 
-onglet_reseau, onglet_ajout, onglet_retrait = st.tabs(
-    ["🕸️ Réseau des aversions", "➕ Ajouter", "➖ Retirer"]
+# Vocabulaire commun : aliments des aversions + ingrédients des recettes
+aliments_connus = set(aliments_existants)
+for _ing in recettes_df["Ingrédients"]:
+    aliments_connus.update(i.strip() for i in _ing.split(",") if i.strip())
+aliments_connus = sorted(aliments_connus)
+
+onglet_reseau, onglet_recettes, onglet_ajout, onglet_retrait = st.tabs(
+    ["🕸️ Réseau des aversions", "📖 Recettes", "➕ Ajouter", "➖ Retirer"]
 )
 
 # --- Onglet principal : le réseau ------------------------------------------
@@ -161,6 +223,130 @@ with onglet_reseau:
             )
             st.subheader("📋 Aliments à éviter pour ce groupe")
             st.dataframe(aliments_a_eviter, width="stretch", hide_index=True)
+
+            st.subheader("🍲 Suggestions de recettes")
+            if recettes_df.empty:
+                st.info("Aucune recette enregistrée : ajoutez-en dans l'onglet « Recettes ».")
+            else:
+                col_e, col_p, col_d, col_btn = st.columns([1, 1, 1, 2])
+                categories = []
+                if col_e.checkbox("Entrée"):
+                    categories.append("Entrée")
+                if col_p.checkbox("Plat", value=True):
+                    categories.append("Plat")
+                if col_d.checkbox("Dessert"):
+                    categories.append("Dessert")
+                if col_btn.button("🎲 Nouvelle sélection"):
+                    st.session_state["graine"] = st.session_state.get("graine", 0) + 1
+
+                if not categories:
+                    st.warning("Cochez au moins une catégorie.")
+                else:
+                    candidates = recettes_df[recettes_df["Type"].isin(categories)]
+                    eligibles = recettes_compatibles(candidates, set(sous_df[COL_ALIMENT]))
+                    if eligibles.empty:
+                        st.warning(
+                            "Aucune recette de ces catégories n'est compatible avec ce groupe. "
+                            "Essayez d'autres catégories ou ajoutez des recettes."
+                        )
+                    else:
+                        n = min(5, len(eligibles))
+                        suggestions = eligibles.sample(
+                            n=n, random_state=st.session_state.get("graine", 0)
+                        )
+                        st.caption(
+                            f"{n} suggestion(s) tirée(s) au hasard parmi {len(eligibles)} "
+                            f"recette(s) compatibles avec : {', '.join(selection)}."
+                        )
+                        st.dataframe(
+                            suggestions,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "Lien": st.column_config.LinkColumn(
+                                    "Recette complète", display_text="Ouvrir sur Marmiton"
+                                ),
+                            },
+                        )
+
+# --- Onglet recettes --------------------------------------------------------
+with onglet_recettes:
+    if recettes_df.empty:
+        st.info("Aucune recette enregistrée pour l'instant : ajoutez la première ci-dessous !")
+    else:
+        recettes = recettes_df
+        col_recherche, col_type = st.columns([2, 1])
+        recherche = col_recherche.text_input(
+            "🔍 Rechercher :", placeholder="nom de recette ou ingrédient…"
+        )
+        types = ["Tous"] + sorted(t for t in recettes["Type"].unique() if t)
+        choix_type = col_type.selectbox("Type de plat :", types)
+
+        filtrees = recettes
+        if choix_type != "Tous":
+            filtrees = filtrees[filtrees["Type"] == choix_type]
+        if recherche.strip():
+            terme = recherche.strip()
+            masque = filtrees["Recette"].str.contains(
+                terme, case=False, regex=False
+            ) | filtrees["Ingrédients"].str.contains(terme, case=False, regex=False)
+            filtrees = filtrees[masque]
+
+        st.caption(f"{len(filtrees)} recette(s) — les liens ouvrent la recette complète sur Marmiton.")
+        st.dataframe(
+            filtrees,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Lien": st.column_config.LinkColumn(
+                    "Recette complète", display_text="Ouvrir sur Marmiton"
+                ),
+            },
+        )
+
+    st.divider()
+    st.subheader("Ajouter une recette")
+
+    nom_recette = st.text_input("Nom de la recette (ex : Gratin de courgettes)")
+    type_recette = st.selectbox("Type :", ["Plat", "Entrée", "Dessert"])
+    ingredients_choisis = st.multiselect(
+        "Ingrédients déjà connus :",
+        options=aliments_connus,
+        help="Réutilisez les noms existants autant que possible : c'est ce qui permet "
+        "de filtrer les recettes selon les aversions de chacun.",
+    )
+    nouveaux_ingredients = st.text_input(
+        "Nouveaux ingrédients, séparés par des virgules (si absents de la liste ci-dessus)"
+    )
+    lien_recette = st.text_input("Lien vers la recette complète (optionnel)")
+
+    if st.button("Ajouter la recette", type="primary"):
+        nom_recette = nom_recette.strip()
+        ingredients = [normaliser(i) for i in ingredients_choisis]
+        ingredients += [
+            normaliser(i) for i in nouveaux_ingredients.split(",") if i.strip()
+        ]
+        ingredients = sorted(set(ingredients))
+        if not nom_recette:
+            st.error("Veuillez indiquer le nom de la recette.")
+        elif not ingredients:
+            st.error("Veuillez indiquer au moins un ingrédient.")
+        elif nom_recette.lower() in recettes_df["Recette"].str.lower().values:
+            st.error(f"« {nom_recette} » existe déjà dans la liste.")
+        else:
+            nouvelle = pd.DataFrame(
+                [
+                    {
+                        "Recette": nom_recette,
+                        "Type": type_recette,
+                        "Ingrédients": ", ".join(ingredients),
+                        "Lien": lien_recette.strip(),
+                    }
+                ]
+            )
+            sauvegarder_recettes(pd.concat([recettes_df, nouvelle]))
+            st.success(f"« {nom_recette} » ({type_recette}) a été ajoutée.")
+            st.rerun()
 
 # --- Onglet ajout -----------------------------------------------------------
 with onglet_ajout:
