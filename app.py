@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from pyvis.network import Network
+from streamlit_gsheets import GSheetsConnection
 
 DATA_FILE = Path(__file__).parent / "data.csv"
 COL_NOM = "Nom"
@@ -22,20 +23,45 @@ COULEUR_ALIMENT = "#f28e2b"
 
 
 # ---------------------------------------------------------------------------
-# Stockage (à remplacer plus tard par la Google Sheet)
+# Stockage : Google Sheet si configurée (secrets), sinon CSV local
 # ---------------------------------------------------------------------------
 
+FEUILLE = "aversions"  # nom de l'onglet dans la Google Sheet
+
+
+def utilise_gsheet() -> bool:
+    try:
+        return "gsheets" in st.secrets.get("connections", {})
+    except Exception:
+        return False
+
+
+def _nettoyer(df: pd.DataFrame) -> pd.DataFrame:
+    df = df[[COL_NOM, COL_ALIMENT]].fillna("").astype(str)
+    df[COL_NOM] = df[COL_NOM].str.strip()
+    df[COL_ALIMENT] = df[COL_ALIMENT].str.strip()
+    return df[(df[COL_NOM] != "") & (df[COL_ALIMENT] != "")]
+
+
 def charger_donnees() -> pd.DataFrame:
+    if utilise_gsheet():
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        df = conn.read(worksheet=FEUILLE, ttl=0)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=[COL_NOM, COL_ALIMENT])
+        return _nettoyer(df)
     if DATA_FILE.exists():
-        df = pd.read_csv(DATA_FILE, dtype=str).fillna("")
-        df = df[(df[COL_NOM] != "") & (df[COL_ALIMENT] != "")]
-        return df
+        return _nettoyer(pd.read_csv(DATA_FILE, dtype=str))
     return pd.DataFrame(columns=[COL_NOM, COL_ALIMENT])
 
 
 def sauvegarder_donnees(df: pd.DataFrame) -> None:
     df = df.sort_values([COL_NOM, COL_ALIMENT]).reset_index(drop=True)
-    df.to_csv(DATA_FILE, index=False)
+    if utilise_gsheet():
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        conn.update(worksheet=FEUILLE, data=df)
+    else:
+        df.to_csv(DATA_FILE, index=False)
 
 
 def normaliser(texte: str) -> str:
